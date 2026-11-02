@@ -5,7 +5,8 @@
 #   ./infra/aws/provision-aws-resources.sh pre-cluster   # IAM, ECR, log group, backup/Tempo buckets, CodeBuild, WAF, ACM
 #   ./infra/aws/provision-aws-resources.sh cluster       # eksctl create cluster + Karpenter discovery tags
 #   ./infra/aws/provision-aws-resources.sh post-cluster  # RDS MySQL Multi-AZ + Secrets Manager secrets
-#   ./infra/aws/provision-aws-resources.sh grafana-waf   # /grafana IP allow-list (re-run when the IP changes)
+#   ./infra/aws/provision-aws-resources.sh grafana-waf   # /grafana + /was IP allow-list (re-run when the IP changes)
+#   STAFF_WAF_SCOPE=all ... grafana-waf                   # whole site behind the allow-list (before rolling back web)
 #
 # Idempotent: every step looks the resource up first and reuses (or updates) it, so a phase that
 # stopped half-way can simply be run again. Existing resources are not reconfigured beyond what
@@ -502,12 +503,20 @@ post_cluster() {
   fi
 }
 
-# /grafana is only for the operators' IPs (docs/features/grafana-public-path/design.md): an IP set
-# from GRAFANA_ALLOWED_CIDRS and a block rule at priority 0, ahead of the managed rule groups.
-# Re-run alone after the allowed IP changes. An empty list blocks /grafana for everyone.
+# /grafana and the staff app at /was are only for the staff IPs (docs/features/grafana-public-path/design.md,
+# docs/features/landing-page/design.md): an IP set from GRAFANA_ALLOWED_CIDRS and one block rule at
+# priority 0, ahead of the managed rule groups, answering with the designed 403 page (waf-staff-403.html;
+# its image comes from web Nginx's public /resources/). The IP set keeps its original grafana name.
+# Re-run alone after the allowed IP changes. An empty list blocks /grafana and /was for everyone.
+# STAFF_WAF_SCOPE=all puts every path except /resources/ (the 403 page's image) behind the allow-list:
+# a web image from before /was proxies / to the staff app, so it goes first in that rollback
+# (docs/features/landing-page/design.md Q8). Run again without it to go back to /grafana + /was.
 grafana_waf() {
   require AWS_REGION EKS_CLUSTER_NAME WAF_WEB_ACL_ARN
-  local set_name="${EKS_CLUSTER_NAME}-grafana-allowed-ips" rule=BlockUnauthorizedGrafanaAccess
+  local scope="${STAFF_WAF_SCOPE:-staff}"
+  [[ "$scope" =~ ^(staff|all)$ ]] || { echo "STAFF_WAF_SCOPE must be staff or all (got $scope)" >&2; exit 1; }
+  local set_name="${EKS_CLUSTER_NAME}-grafana-allowed-ips" rule=BlockUnauthorizedStaffAccess
+  local old_rule=BlockUnauthorizedGrafanaAccess body_key=petclinic-staff-403 bodies
   local cidrs=() addrs c set_id set_arn lock acl_id="${WAF_WEB_ACL_ARN##*/}" acl_name acl rules
   local list="${GRAFANA_ALLOWED_CIDRS:-}"
   IFS=',' read -r -a cidrs <<<"${list//[[:space:]]/}"  # "a/32, b/32" is fine too
@@ -521,7 +530,7 @@ grafana_waf() {
   set_id=$(aws wafv2 list-ip-sets --scope REGIONAL --query "IPSets[?Name=='$set_name'].Id | [0]" --output text)
   if [ "$set_id" = "None" ] || [ -z "$set_id" ]; then
     set_arn=$(aws wafv2 create-ip-set --scope REGIONAL --name "$set_name" --ip-address-version IPV4 \
-      --description "Allowed source IPs for /grafana" --addresses "${addrs[@]}" \
+      --description "Allowed source IPs for /grafana and /was staff access" --addresses "${addrs[@]}" \
       --query Summary.ARN --output text)
   else
     lock=$(aws wafv2 get-ip-set --scope REGIONAL --name "$set_name" --id "$set_id" --query LockToken --output text)
@@ -530,27 +539,38 @@ grafana_waf() {
     set_arn=$(aws wafv2 get-ip-set --scope REGIONAL --name "$set_name" --id "$set_id" --query IPSet.ARN --output text)
   fi
 
-  echo "== WAF rule $rule (priority 0) in the WebACL"
+  echo "== WAF rule $rule (priority 0, scope $scope) in the WebACL"
   acl_name=$(aws wafv2 list-web-acls --scope REGIONAL --query "WebACLs[?Id=='$acl_id'].Name | [0]" --output text)
   acl=$(aws wafv2 get-web-acl --scope REGIONAL --name "$acl_name" --id "$acl_id")
-  # Decode and normalise the path the way NGF's nginx does (%67rafana, //grafana, /./grafana), then
-  # block it unless the client IP is in the set. The other rules keep their order behind it.
-  rules=$(jq --arg rule "$rule" --arg set "$set_arn" '
-    [.WebACL.Rules[] | select(.Name != $rule)] | sort_by(.Priority)
+  # Decode and normalise the path the way NGF's nginx does (%67rafana, //was, /./grafana), then
+  # block it unless the client IP is in the set. The other rules keep their order behind it; the
+  # /grafana-only rule this one replaces is dropped.
+  rules=$(jq --arg rule "$rule" --arg old "$old_rule" --arg set "$set_arn" --arg key "$body_key" --arg scope "$scope" '
+    def path($p): {ByteMatchStatement: {FieldToMatch: {UriPath: {}}, PositionalConstraint: "STARTS_WITH",
+      SearchString: $p, TextTransformations: [
+        {Priority: 0, Type: "URL_DECODE"}, {Priority: 1, Type: "NORMALIZE_PATH"},
+        {Priority: 2, Type: "LOWERCASE"}]}};
+    [.WebACL.Rules[] | select(.Name != $rule and .Name != $old)] | sort_by(.Priority)
     | to_entries | map(.value + {Priority: (.key + 1)})
-    | [{Name: $rule, Priority: 0, Action: {Block: {}},
+    | [{Name: $rule, Priority: 0,
+        Action: {Block: {CustomResponse: {ResponseCode: 403, CustomResponseBodyKey: $key,
+          # Served by WAF, not web Nginx, so the Nginx security headers are set here too.
+          ResponseHeaders: [{Name: "Cache-Control", Value: "no-store"}, {Name: "X-Frame-Options", Value: "DENY"},
+            {Name: "X-Content-Type-Options", Value: "nosniff"}]}}},
         VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: $rule},
         Statement: {AndStatement: {Statements: [
-          {ByteMatchStatement: {FieldToMatch: {UriPath: {}}, PositionalConstraint: "STARTS_WITH",
-            SearchString: "/grafana", TextTransformations: [
-              {Priority: 0, Type: "URL_DECODE"}, {Priority: 1, Type: "NORMALIZE_PATH"},
-              {Priority: 2, Type: "LOWERCASE"}]}},
+          if $scope == "all" then {NotStatement: {Statement: path("/resources/")}}
+          else {OrStatement: {Statements: [path("/grafana"), path("/was")]}} end,
           {NotStatement: {Statement: {IPSetReferenceStatement: {ARN: $set}}}}]}}}] + .' <<<"$acl")
+  # Other response bodies in the WebACL are kept. WAF sets Content-Type from ContentType.
+  bodies=$(jq -c --arg key "$body_key" --rawfile html "$ROOT/infra/aws/waf-staff-403.html" \
+    '(.WebACL.CustomResponseBodies // {}) + {($key): {ContentType: "TEXT_HTML", Content: $html}}' <<<"$acl")
   # SearchString is a blob: CLI v2 would base64-decode "/grafana" into bytes that never match.
   aws wafv2 update-web-acl --scope REGIONAL --name "$acl_name" --id "$acl_id" --cli-binary-format raw-in-base64-out \
     --lock-token "$(jq -r .LockToken <<<"$acl")" \
     --default-action "$(jq -c .WebACL.DefaultAction <<<"$acl")" \
     --visibility-config "$(jq -c .WebACL.VisibilityConfig <<<"$acl")" \
+    --custom-response-bodies "$bodies" \
     --rules "$rules" >/dev/null
   aws wafv2 get-web-acl --scope REGIONAL --name "$acl_name" --id "$acl_id" \
     --query 'WebACL.Rules[].[Priority,Name]' --output text

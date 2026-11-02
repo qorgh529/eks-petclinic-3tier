@@ -12,3 +12,9 @@ if [ -n "${JDBC_DRIVER_CLASS_NAME:-}" ]; then
 fi
 
 export CATALINA_OPTS
+
+# Phase 1 of the move to /was: the Host's RewriteValve reads conf/Catalina/localhost/rewrite.config, and
+# conf/Catalina is an emptyDir in k8s (writable under readOnlyRootFilesystem), which hides anything the
+# image puts there. Removed in phase 2 with the valve.
+mkdir -p "$CATALINA_BASE/conf/Catalina/localhost"
+cp /opt/petclinic/rewrite.config "$CATALINA_BASE/conf/Catalina/localhost/rewrite.config"

@@ -7,8 +7,10 @@
 
 <petclinic:layout pageName="owners">
     <jsp:attribute name="customScript">
-        <link rel="stylesheet" href="/webjars/flatpickr/4.6.13/dist/flatpickr.min.css">
-        <script src="/webjars/flatpickr/4.6.13/dist/flatpickr.js"></script>
+        <spring:url value="/webjars/flatpickr/4.6.13/dist/flatpickr.min.css" var="flatpickrCss"/>
+        <spring:url value="/webjars/flatpickr/4.6.13/dist/flatpickr.js" var="flatpickrJs"/>
+        <link rel="stylesheet" href="${flatpickrCss}">
+        <script src="${flatpickrJs}"></script>
         <script>
             flatpickr("#date", {dateFormat: "Y/m/d"});
         </script>

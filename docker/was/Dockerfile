@@ -1,15 +1,16 @@
 # Build context: repository root
 #   docker build -f docker/was/Dockerfile -t was:<tag> .
 
-# ---- Stage 1: build ROOT.war (MySQL profile, credentials injected at runtime) ----
+# ---- Stage 1: build the WAR (MySQL profile, credentials injected at runtime) ----
 FROM maven:3.9.9-eclipse-temurin-21 AS build
 WORKDIR /src
 COPY app/pom.xml .
 COPY app/src ./src
 # Tests run against H2 outside the image build (./mvnw test); -P MySQL disables the H2 profile.
 # Unpacked here so Tomcat never writes to webapps/ (allows readOnlyRootFilesystem).
+# Deployed as webapps/was: the app lives under /was/, and web Nginx serves / itself.
 RUN mvn -B -P MySQL -DskipTests package \
- && mkdir /ROOT && cd /ROOT && jar xf /src/target/petclinic.war
+ && mkdir /was && cd /was && jar xf /src/target/petclinic.war
 
 ARG JMX_EXPORTER_VERSION=1.0.1
 ARG JMX_EXPORTER_SHA256=7d61f737fd661610ccc14aea79764faa1ea94a340cbc8f0029b3d2edea3d80c1
@@ -28,10 +29,13 @@ RUN rm -rf webapps/* webapps.dist \
  && useradd -u 10001 -g app -M -s /usr/sbin/nologin app \
  && mkdir -p conf/Catalina/localhost
 
-COPY --from=build /ROOT webapps/ROOT
+COPY --from=build /was webapps/was
 COPY --from=build /jmx_prometheus_javaagent.jar /opt/jmx/jmx_prometheus_javaagent.jar
 COPY docker/was/jmx-exporter-config.yaml /opt/jmx/config.yaml
 COPY docker/was/setenv.sh bin/setenv.sh
+COPY docker/was/server.xml conf/server.xml
+# conf/Catalina is an emptyDir in k8s, so setenv.sh copies this into place at start.
+COPY docker/was/rewrite.config /opt/petclinic/rewrite.config
 
 # Tomcat writes only runtime state (mounted as emptyDir in k8s; owned by 10001 for plain docker run).
 RUN chmod 0755 bin/setenv.sh \

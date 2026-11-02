@@ -27,12 +27,24 @@ OPEN_STABLE="${STABLE_WEIGHT:-90}" OPEN_CANARY="${CANARY_WEIGHT:-10}"
 check_weights "$OPEN_STABLE" "$OPEN_CANARY"
 
 "$ROOT/scripts/validate-manifests.sh"
-# Stop before anything changes rather than publish /grafana to every IP.
-grafana_waf_ready || { echo "WAF WebACL has no /grafana allow-list rule at priority 0:" \
+# Stop before anything changes rather than publish /grafana or /was to every IP.
+staff_waf_ready || { echo "WAF WebACL has no /grafana + /was allow-list rule at priority 0:" \
   "run ./infra/aws/provision-aws-resources.sh grafana-waf first" >&2; exit 1; }
 
 K="$ROOT/k8s"
 aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+# Stable and canary share manifests, so a new STABLE_IMAGE_TAG reaches stable users before the canary
+# check below. Changing it must be a deliberate promotion (PROMOTE_STABLE=1), normally to the tag that
+# already passed as CANARY_IMAGE_TAG. A first deploy (no stable Deployment yet) needs no flag.
+for d in was-stable web; do
+  cur=$(kubectl -n petclinic get deploy "$d" --ignore-not-found -o jsonpath='{.spec.template.spec.containers[0].image}')
+  if [ -n "$cur" ] && [ "${cur##*:}" != "$STABLE_IMAGE_TAG" ] && [ "${PROMOTE_STABLE:-}" != 1 ]; then
+    echo "deploy/$d runs ${cur##*:} but STABLE_IMAGE_TAG is $STABLE_IMAGE_TAG: try new images as CANARY_IMAGE_TAG," \
+      "then promote with PROMOTE_STABLE=1" >&2
+    exit 1
+  fi
+done
 
 # Placement for cluster controllers: ng-critical only.
 CRITICAL=$(mktemp)
@@ -149,13 +161,15 @@ STABLE_WEIGHT=100 CANARY_WEIGHT=0 render_all "$K/gateway" | kubectl apply -f -
 wait_route_accepted
 
 echo "== Workloads (canary held at 0% until it passes the check below)"
+# WAS before web (docs/features/landing-page/design.md Q7): a /was WAS also serves / (rewrite), so it
+# fits an old web, but a new web only proxies /was/, which an old WAS does not have.
 # Instrumentation first: pods created before it exists start without the agent.
 render "$K/was/instrumentation.yaml" | kubectl apply -f -
 render_all "$K/was" | kubectl apply -f -
-render_all "$K/web" | kubectl apply -f -
 kubectl -n petclinic rollout status deploy/was-stable --timeout=600s
-kubectl -n petclinic rollout status deploy/web --timeout=300s
 kubectl -n petclinic rollout status deploy/was-canary --timeout=600s
+render_all "$K/web" | kubectl apply -f -
+kubectl -n petclinic rollout status deploy/web --timeout=300s
 kubectl -n petclinic rollout status deploy/web-canary --timeout=300s
 
 echo "== Route 53 alias -> ALB"
@@ -174,15 +188,20 @@ aws route53 change-resource-record-sets --hosted-zone-id "$ROUTE53_HOSTED_ZONE_I
         AliasTarget: {HostedZoneId: $zone, DNSName: $alb, EvaluateTargetHealth: true}}}]}')" >/dev/null
 
 # End-to-end canary check: web-canary /healthz does not touch WAS, so hit a page served by was-canary.
-# --connect-to goes straight to the ALB (no wait on DNS) while TLS still validates against DOMAIN_NAME.
+# /was is behind the WAF allow-list, which the deploy host may not be in: that page is fetched through
+# web-canary's own Nginx (web-canary -> was-canary), and the landing page through the ALB, where
+# X-Canary pins it to web-canary. --connect-to goes straight to the ALB (no wait on DNS) while TLS
+# still validates against DOMAIN_NAME.
 echo "== Canary path check (X-Canary: always)"
 ok=""
 for _ in $(seq 1 30); do
-  if curl -fsS -o /dev/null --max-time 10 --connect-to "$DOMAIN_NAME:443:$alb:443" \
-      -H "X-Canary: always" "https://$DOMAIN_NAME/owners?lastName="; then ok=1; break; fi
+  if kubectl -n petclinic exec deploy/web-canary -c nginx -- \
+      wget -q -O /dev/null "http://127.0.0.1:8080/was/owners?lastName=" \
+    && curl -fsS -o /dev/null --max-time 10 --connect-to "$DOMAIN_NAME:443:$alb:443" \
+      -H "X-Canary: always" "https://$DOMAIN_NAME/"; then ok=1; break; fi
   sleep 10
 done
-[ -n "$ok" ] || { echo "canary path check failed: https://$DOMAIN_NAME/owners via X-Canary: always; canary stays at 0%" >&2; exit 1; }
+[ -n "$ok" ] || { echo "canary path check failed: /was/owners via web-canary or https://$DOMAIN_NAME/ via X-Canary: always; canary stays at 0%" >&2; exit 1; }
 
 echo "== Open canary: $OPEN_STABLE/$OPEN_CANARY (later changes: scripts/set-canary-weight.sh)"
 apply_route_weights "$OPEN_STABLE" "$OPEN_CANARY"

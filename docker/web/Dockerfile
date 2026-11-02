@@ -23,6 +23,8 @@ RUN sed -i -e '/^user /d' -e 's#/var/run/nginx.pid#/tmp/nginx.pid#' /etc/nginx/n
  && chown -R 10001:10001 /var/cache/nginx /etc/nginx/conf.d
 
 COPY --from=assets /static /usr/share/nginx/html
+# Public landing page, 404 page and their stylesheet (docs/features/landing-page/design.md).
+COPY docker/web/static /usr/share/nginx/html
 # Rendered to /etc/nginx/conf.d/default.conf by the image entrypoint (envsubst of defined env vars only).
 COPY docker/web/nginx.conf /etc/nginx/templates/default.conf.template
 

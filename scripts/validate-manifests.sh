@@ -478,6 +478,54 @@ if ("grafana-waf) grafana_waf" not in prov or '"URL_DECODE"' not in prov or '"NO
     err("provision-aws-resources.sh: grafana-waf must block /grafana after URL_DECODE + NORMALIZE_PATH,"
         " sending SearchString raw (--cli-binary-format raw-in-base64-out)")
 
+# 13. Landing page and the staff app under /was (docs/features/landing-page/design.md).
+for f in ("k8s/was/deployment-stable.yaml", "k8s/was/deployment-canary.yaml"):
+    dep = one(f, "Deployment") or {}
+    for c in dep.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])[:1]:
+        for probe in ("startupProbe", "readinessProbe"):
+            # Phase 1 (Q7): / so either image fits the shared manifests; /was/ in phase 2.
+            if ((c.get(probe) or {}).get("httpGet") or {}).get("path") != "/":
+                err(f"{f}: {c.get('name')} {probe} must GET / until phase 2 (old and new images both answer it)")
+was_df = (root / "docker/was/Dockerfile").read_text(encoding="utf-8")
+if ("webapps/was" not in was_df or "webapps/ROOT" in was_df or "COPY docker/was/server.xml conf/server.xml" not in was_df
+        or "COPY docker/was/rewrite.config /opt/petclinic/rewrite.config" not in was_df
+        or "conf/Catalina/localhost/rewrite.config" not in (root / "docker/was/setenv.sh").read_text(encoding="utf-8")):
+    err("docker/was/Dockerfile: deploy the app as webapps/was (not ROOT) with server.xml; setenv.sh puts the phase 1"
+        " rewrite.config under conf/Catalina (an emptyDir in k8s)")
+sx = (root / "docker/was/server.xml").read_text(encoding="utf-8")
+if ("org.apache.catalina.valves.RemoteIpValve" not in sx or 'protocolHeader="x-forwarded-proto"' not in sx
+        or 'internalProxies="10\\.' not in sx or "org.apache.catalina.valves.rewrite.RewriteValve" not in sx):
+    err("docker/was/server.xml: RemoteIpValve trusting x-forwarded-proto from private addresses only, and the phase 1 RewriteValve")
+ngx = (root / "docker/web/nginx.conf").read_text(encoding="utf-8")
+was_loc = re.search(r"location /was/ \{(.*?)\n    \}", ngx, re.S)  # ${VAR} braces inside
+if (not was_loc or "proxy_set_header X-Forwarded-Proto https;" not in was_loc.group(1)
+        or "location = / {" not in ngx or "error_page 404 /404.html;" not in ngx or "absolute_redirect off;" not in ngx
+        or re.search(r"location / \{[^}]*proxy_pass", ngx, re.S)):
+    err("docker/web/nginx.conf: / is static (index.html, 404 page), only /was/ is proxied with X-Forwarded-Proto https,"
+        " and Nginx's own redirects are relative (absolute_redirect off)")
+for page in ("docker/web/static/index.html", "docker/web/static/404.html"):
+    if not (root / page).is_file():
+        err(f"{page}: missing")
+body = root / "infra/aws/waf-staff-403.html"
+if not body.is_file() or body.stat().st_size > 4096:
+    err("infra/aws/waf-staff-403.html: WAF custom response body must exist and stay within 4 KB")
+elif ('src="/resources/images/403.webp"' not in body.read_text(encoding="utf-8")
+        or not (root / "app/src/main/webapp/resources/images/403.webp").is_file()):
+    err("waf-staff-403.html: its image must be the public /resources/images/403.webp served by web Nginx")
+# Q7: the WAS rolls out before web: a new WAS fits an old web, a new web does not fit an old WAS.
+dep = (root / "scripts/deploy-all.sh").read_text(encoding="utf-8")
+order = [dep.find(x) for x in ('render_all "$K/was"', "rollout status deploy/was-stable", 'render_all "$K/web"')]
+if -1 in order or order != sorted(order):
+    err("deploy-all.sh: apply the WAS and wait for its rollout before applying the web manifests")
+if 'PROMOTE_STABLE:-}" != 1' not in dep or dep.find("PROMOTE_STABLE") > dep.find('render_all "$K/was"'):
+    err("deploy-all.sh: a changed STABLE_IMAGE_TAG must need PROMOTE_STABLE=1, checked before any workload changes")
+rw = (root / "docker/was/rewrite.config").read_text(encoding="utf-8")
+if "RewriteCond %{REQUEST_URI} !^/was(/.*)?$" not in rw or "RewriteRule ^/(.*)$ /was/$1" not in rw:
+    err("docker/was/rewrite.config: phase 1 must send everything outside /was to the /was app")
+if ("rule=BlockUnauthorizedStaffAccess" not in prov or 'path("/was")' not in prov
+        or "--custom-response-bodies" not in prov):
+    err("provision-aws-resources.sh: grafana-waf must block /grafana and /was in one rule with the 403 page")
+
 if errors:
     print("\n".join("FAIL " + e for e in errors))
     sys.exit(1)
