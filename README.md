@@ -1,206 +1,225 @@
-# AWS EKS 기반 Spring Framework PetClinic 클라우드 네이티브 아키텍처
+# EKS PetClinic 3-Tier — Amazon EKS 기반 컨테이너 3Tier 서비스 운영
 
-전통적인 `spring-framework-petclinic`(Spring Framework 7.x / Jakarta EE 11 WAR 패키징)을 AWS 서울 리전(`ap-northeast-2`)의 **Amazon EKS (`1.36`)** 위에 **Multi-AZ 고가용성**, **Gateway API 기반 카나리(Canary) 배포**, **3-Tier 노드 격리(Karpenter + Managed NodeGroups)**, **최소 권한 보안(Zero Hardcoded Secrets & Least Privilege)**, **통합 관측성(Prometheus / Grafana / Alertmanager / CloudWatch Logs / OpenTelemetry + Tempo 분산 트레이싱)** 구조로 구축한 프로젝트입니다.
+| 구분 | 내용 |
+|---|---|
+| 프로젝트 유형 | 개인 프로젝트 (1인 설계·구현·운영) |
+| 주제 | 쿠버네티스 관리형 서비스(Amazon EKS)로 3Tier 웹 서비스 운영 |
+| 대상 애플리케이션 | Spring Framework PetClinic (WAR, Spring 7 / Java 21) |
+| 작업 기간 | 2026-10-22 ~ 2026-10-27 |
+| 리전 | AWS 서울 `ap-northeast-2` (AZ `2a` · `2c`) |
+| 저장소 원칙 | 모든 인프라·배포를 스크립트와 매니페스트로 재현, Public 저장소이므로 시크릿은 코드에 두지 않음 |
 
-![AWS EKS 기반 Spring Framework PetClinic 아키텍처](./docs/architecture.drawio.svg)
-
-> 편집 가능한 원본 다이어그램: [`docs/architecture.drawio`](./docs/architecture.drawio) · [`docs/architecture.drawio.svg`](./docs/architecture.drawio.svg) · [`docs/architecture.drawio.png`](./docs/architecture.drawio.png)
-
----
-
-## 1. 핵심 아키텍처 하이라이트
-
-- **Edge & L7 Gateway 보안 라우팅**:
-  - **Route 53 + ACM + AWS WAFv2**(`CommonRuleSet`, `SQLiRuleSet`, `KnownBadInputsRuleSet`)로 인터넷 경계를 보호하고, **AWS Load Balancer Controller(LBC)** 가 생성한 ALB(`target-type: ip`, HTTPS 443 강제, 비정상 헤더 드롭)가 **NGINX Gateway Fabric(NGF)** Pod로 직접 라우팅합니다.
-- **안전한 카나리 배포 게이팅 (Canary Traffic Gating)**:
-  - `web`/`was-stable`(`STABLE_IMAGE_TAG`)과 `web-canary`/`was-canary`(`CANARY_IMAGE_TAG`)의 버전을 분리합니다.
-  - 배포 시 먼저 `HTTPRoute` 가중치를 **`100:0`으로 고정(Gateway `Accepted` 확인)** 한 상태에서 카나리 Pod를 롤아웃하고, `X-Canary: always` 헤더로 동적 DB 조회 경로(`/owners?lastName=`)를 E2E 검증한 뒤에만 운영자가 정한 비율(`STABLE_WEIGHT`/`CANARY_WEIGHT`, 기본 **`90:10`**)로 개방합니다. 이후 비율 확대·롤백은 재배포 없이 `scripts/set-canary-weight.sh`로 합니다.
-- **Web / WAS 2-Tier 분리 및 정교한 오토스케일링**:
-  - **Web 계층 (`web`, Nginx 1.27)**: 정적 에셋(`/resources/*`, `/webjars/*`) 직접 서빙 및 보안 응답 헤더 부여, 동적 요청은 WAS(`:8080`)로 프록시. CPU 사용률(60%) 기준 **HPA**(`web` 2~10, `web-canary` 1~4)로 수평 확장.
-  - **WAS 계층 (`was`, Tomcat 11 + Java 21)**: 사전 언패킹된 `webapps/ROOT` 구동 및 **JMX Exporter**(`:9404/metrics`) 내장. Prometheus가 수집한 초당 요청 수(`> 50 req/s`)를 기반으로 **KEDA `ScaledObject`**(`was-stable` 2~10 / `fallback: 4`, `was-canary` 1~3 / `fallback: 2`)가 수평 확장.
-  - **DB 커넥션 풀 예산 관리**: Pod당 Tomcat JDBC Pool 상한(`maxActive=10`)을 적용하여 최대 스케일 아웃 및 롤링 업데이트 중에도 RDS `db.t3.medium`의 `max_connections` 고갈을 방지합니다.
-- **3-Tier 노드 역할 분리**:
-  - `np-app` + `np-app-spot` (**Karpenter `NodePool`**): 애플리케이션(`NGF`, `web`, `was`) 전용. 기본 용량은 On-Demand(`np-app`, weight 100)에 보장하고 초과 부하만 Spot(`np-app-spot`)으로 확장.
-  - `ng-critical` (**EKS 관리형 노드 그룹**, Taint `node-role=critical:NoSchedule`): 클러스터 핵심 컨트롤러(`CoreDNS`, `LBC`, `Metrics Server`, `Karpenter`, `KEDA`, `ESO`, `EBS CSI`, `OpenTelemetry Operator`) 및 DB 초기화 `Job` / 백업 `CronJob` 전용.
-  - `ng-platform` (**EKS 관리형 노드 그룹**, Taint `node-role=platform:NoSchedule`): 모니터링 스택(`Prometheus` 2 Replicas Multi-AZ, `Grafana`, `Alertmanager`, `OTel Collector`, `Tempo`) 및 암호화 EBS `gp3` PVC(`WaitForFirstConsumer`) 전용.
-- **분산 트레이싱 (APM, `docs/features/apm-tracing/design.md`)**:
-  - **OpenTelemetry Operator**가 `was-stable`/`was-canary`에 Java agent를 init container로 주입합니다(이미지 재빌드 없음). 리소스 속성 `service.name=petclinic-was`, `service.version=stable|canary`로 카나리를 구분하고, 로그에는 MDC로 `trace_id`/`span_id`가 남습니다.
-  - 헤드 샘플링은 agent(SDK)에서 `parentbased_traceidratio`(`OTEL_TRACES_SAMPLER_ARG`, 기본 `0.1`)로 하고, RED 메트릭(`http_server_request_duration_seconds`)은 샘플링 없이 100% 집계됩니다. exemplar는 샘플링된 트레이스에만 붙어 Grafana 패널에서 Tempo 트레이스로 바로 이동합니다.
-  - 데이터 흐름과 포트:
-
-    | 구간 | 포트 | 내용 |
-    |---|---|---|
-    | `was` → OTel Collector | `4317` gRPC / `4318` HTTP | OTLP 트레이스(10%) + 메트릭(100%, exemplar) |
-    | Collector → Tempo | `4317` | OTLP gRPC (`memory_limiter` → `batch`) |
-    | Prometheus → Collector | `8889` | OpenMetrics scrape (exemplar 포함) |
-    | Grafana → Tempo | `3200` | TraceQL / trace 조회 |
-    | Tempo → S3 | `443` | 전용 버킷 `TEMPO_S3_BUCKET_NAME` (SSE-KMS, 퍼블릭 차단, `TEMPO_RETENTION_DAYS` 만료), IRSA `monitoring/tempo` |
-- **최소 권한 DB 계정 분리 및 시크릿 외부화**:
-  - **RDS MySQL 8.4 LTS Multi-AZ**(Primary/Standby 동기 복제, `require_secure_transport=ON`)를 프라이빗 DB 서브넷에 격리합니다.
-  - DB 계정을 역할별로 3분리하여 각각 **AWS Secrets Manager**와 **External Secrets Operator(ESO)** 로 동기화합니다:
-    - `petclinic_admin` (`petclinic-rds-admin-secret`): `db-init` Job 전용 (스키마/데이터 적재 및 계정 관리)
-    - `petclinic_app` (`petclinic-rds-secret`): `was-stable` / `was-canary` 전용 (`SELECT, INSERT, UPDATE, DELETE`만 허용)
-    - `petclinic_backup` (`petclinic-rds-backup-secret`): `db-backup` CronJob 전용 (`mysqldump` 읽기 권한만 허용, S3 `SSE-KMS` 일일 백업)
-- **컨테이너 및 네트워크 하드닝**:
-  - 모든 워크로드 컨테이너는 비루트(`UID/GID 10001`), `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, `seccompProfile: RuntimeDefault`로 실행됩니다.
-  - `petclinic` 네임스페이스는 `default-deny-all` Ingress/Egress `NetworkPolicy`를 기본 적용하고 필수 통신만 허용하며, 모든 노드에 **IMDSv2 강제 및 Pod IMDS 차단**을 적용합니다.
+> 계정 ID, ARN, 엔드포인트, 비밀번호 같은 실값은 이 문서와 저장소에 넣지 않았습니다.
 
 ---
 
-## 2. 기술 스택 및 버전 명세
+## 1. 과제 정의
+
+**목표**: 전통적인 WAR 기반 Spring 애플리케이션을 컨테이너로 만들어 EKS에 올리고, 실제 운영에 필요한 요소(고가용성, 자동 확장, 보안, 관측성, 무중단 배포, 백업, 비용 관리)를 코드로 재현할 수 있게 갖춘다.
+
+| 계층 | 구성 |
+|---|---|
+| Presentation (WEB) | Nginx 1.27 — 공개 메인 페이지·정적 리소스 직접 응답, `/was/` 만 WAS로 프록시 |
+| Application (WAS) | Tomcat 11 + Spring Framework 7 PetClinic (직원용 앱, `/was` 컨텍스트) |
+| Data (DB) | Amazon RDS for MySQL 8.4 LTS, Multi-AZ, TLS 강제 |
+
+**범위에서 뺀 것**: Spring Boot 전환, 멀티 리전, DB 스키마 변경, CodePipeline 자동 배포(빌드는 명령으로 실행)
+
+### 목표별 결과 요약
+
+| 목표 | 구현 | 검증 결과 |
+|---|---|---|
+| 고가용성 | 2개 AZ, AZ별 NAT, RDS Multi-AZ, Pod AZ 분산 | 롤링 배포·부하 테스트 중 AZ 균형 유지 (최대 8개일 때 2a 4 · 2c 4) |
+| 자동 확장 | was KEDA(요청률), web HPA(CPU), Karpenter 노드 | 450 req/s에서 was 2 → 8개, 노드 2 → 5대, 부하 후 2로 축소 |
+| 보안 | WAF, `/was`·`/grafana` IP 허용 목록, IRSA, NetworkPolicy, ESO | 허용 IP 밖의 `/was`·`/grafana` 접근은 403, 경로 우회 시도도 403 |
+| 관측성 | Prometheus·Grafana, OpenTelemetry·Tempo, Slack 알림 | 404 10건에 5xx 오경보 없음 |
+| 무중단 배포 | 카나리 라우팅, graceful shutdown | 롤링 재시작 중 요청 실패 923건 중 0건 (수정 전 707건 중 2건) |
+| 백업 | `db-backup` CronJob, 매일 03:00 KST S3 적재 | 백업 파일 적재 확인 |
+| 비용 관리 | 일일 중지·기동 스크립트, NAT 끄기 | 아침 기동 12분 13초, 오류 없음 |
+
+---
+
+## 2. 아키텍처
+
+![아키텍처 개요](./docs/architecture-overview.drawio.svg)
+
+![아키텍처 상세 (Pod 배치와 Kubernetes 리소스)](./docs/architecture.drawio.svg)
+
+> 원본: [`docs/architecture-overview.drawio`](./docs/architecture-overview.drawio) · [`docs/architecture.drawio`](./docs/architecture.drawio) · 상세 명세 [`docs/architecture.md`](./docs/architecture.md)
+
+### 요청 흐름
+
+| 단계 | 구간 | 내용 |
+|---|---|---|
+| ① | 브라우저 → Route 53 | A(Alias) 레코드가 ALB를 가리킴 |
+| ② | → AWS WAF → ALB `:443` | 관리형 규칙 3종(Common·SQLi·KnownBadInputs), `/was`·`/grafana` 는 허용 IP만, ACM으로 TLS 종단 |
+| ③ | ALB → NGF Gateway | AWS Load Balancer Controller가 만든 ALB가 `target-type: ip` 로 Gateway Pod에 직접 전달 |
+| ④ | Gateway → `web` / `web-canary` | Gateway API `HTTPRoute` 가중치 분할(평소 90:10), `X-Canary: always` 는 항상 canary |
+| ⑤ | `web` → `was` `:8080` | 공개 페이지는 Nginx가 바로 응답(WAS·DB가 멈춰도 열림), `/was/` 만 Tomcat으로 |
+| ⑥ | `was` → RDS `:3306` | TLS 필수, 앱 전용 최소 권한 DB 계정 |
+
+```mermaid
+flowchart TD
+  U["사용자 브라우저"] --> R53["Route 53"]
+  R53 --> ALB["ALB + WAF"]
+  ALB -->|"/was, /grafana 이고 허용 IP 아님"| D403["403 안내 페이지"]
+  ALB -->|"통과"| NGF["NGINX Gateway Fabric<br/>HTTPRoute"]
+  NGF -->|"가중치 stable"| W["web (Nginx)"]
+  NGF -->|"가중치 canary / X-Canary"| WC["web-canary"]
+  W -->|"/was"| WAS["was-stable (Tomcat 11)"]
+  WC -->|"/was"| WASC["was-canary"]
+  WAS -->|"TLS :3306"| DB[("RDS MySQL 8.4<br/>Multi-AZ")]
+  WASC -->|"TLS :3306"| DB
+```
+
+---
+
+## 3. 기술 스택
 
 | 분류 | 구성 요소 | 버전 / 이미지 |
 |---|---|---|
-| **Application** | Spring Framework PetClinic | `7.0.3` (Spring `7.0.9`, Hibernate `7.4.11.Final`, Java 21 런타임) |
+| **Application** | Spring Framework PetClinic | `7.0.3` (Spring `7.0.9`, Hibernate `7.4.11.Final`, Java 21) |
 | **Web / WAS** | Nginx / Apache Tomcat 11 | `nginx:1.27.2-alpine`, `tomcat:11.0.2-jre21-temurin-noble`, `jmx_prometheus_javaagent:1.0.1` |
-| **Kubernetes** | Amazon EKS / Worker AMI | EKS **`1.36`**, AL2023 **`al2023@v20260930`** |
+| **Kubernetes** | Amazon EKS / Worker AMI | EKS **`1.36`**, AL2023 |
 | **Gateway / Ingress** | Gateway API / NGF / LBC | Gateway API CRDs **`v1.6.3`**, `nginx-gateway-fabric` **`2.8.0`**, `aws-load-balancer-controller` **`3.6.1`** |
 | **Autoscaling** | Karpenter / KEDA / Metrics Server | Karpenter **`1.15.0`**, KEDA **`2.21.0`**, Metrics Server **`3.14.0`** |
-| **Secrets / Storage** | ESO / EBS CSI Driver | `external-secrets` **`2.13.0`** (`v1` API), `aws-ebs-csi-driver` (`${EBS_CSI_ADDON_VERSION}`) |
-| **Observability** | Prometheus Stack / Fluent Bit | `kube-prometheus-stack` **`92.11.0`** (Prometheus `v3.15.0`), `aws-for-fluent-bit` **`0.2.0`** (`3.2.1`) |
-| **Tracing** | OTel Operator / Collector / Java agent / Tempo | `opentelemetry-operator` **`0.105.0`** (`0.144.0`), `opentelemetry-collector` **`0.116.0`** (`otel/opentelemetry-collector-contrib:0.120.0`), `autoinstrumentation-java:2.12.0`, `grafana-community/tempo` **`3.2.1`** (`grafana/tempo:3.1.1`) |
-| **Database / Backup** | Amazon RDS for MySQL / S3 | MySQL **`8.4.11`** LTS (`db.t3.medium` Multi-AZ), `mysql:8.4.11`, `amazon/aws-cli:2.18.0` |
+| **Secrets / Storage** | ESO / EBS CSI Driver | `external-secrets` **`2.13.0`**, `aws-ebs-csi-driver` |
+| **Observability** | Prometheus Stack / Fluent Bit | `kube-prometheus-stack` **`92.11.0`**, `aws-for-fluent-bit` **`0.2.0`** |
+| **Tracing** | OTel Operator / Collector / Tempo | `opentelemetry-operator` **`0.105.0`**, `opentelemetry-collector` **`0.116.0`**, `autoinstrumentation-java:2.12.0`, `grafana/tempo:3.1.1` |
+| **Database / Backup** | RDS for MySQL / S3 | MySQL **`8.4.11`** LTS (`db.t3.medium` Multi-AZ), `mysql:8.4.11` |
+| **Build** | CodeBuild / ECR | `BUILD_GENERAL1_MEDIUM`, ECR `IMMUTABLE` 태그 + KMS 암호화 |
 
 ---
 
-## 3. 사전 준비 사항 (Prerequisites)
+## 4. 주요 구현 내용
 
-1. **로컬 CLI 도구**:
-   - `aws` (AWS CLI v2), `eksctl`, `kubectl`, `helm`, `docker`, `jq`, `envsubst` (`gettext`), `curl`
-   - 오프라인 검증 및 테스트용: `python3` (`PyYAML` 패키지 포함), `promtool` (또는 Docker)
-2. **AWS 네트워크 리소스**: 없으면 `./infra/aws/provision-aws-resources.sh vpc` 로 만들 수 있습니다 (Step 2 참고).
-   - 서울 리전(`ap-northeast-2`)의 VPC 및 `ap-northeast-2a` / `ap-northeast-2c` 가용 영역별 서브넷 ID:
-     - 퍼블릭 서브넷 2개 (`PUBLIC_SUBNET_A_ID`, `PUBLIC_SUBNET_C_ID`)
-     - 앱 프라이빗 서브넷 2개 (`APP_PRIVATE_SUBNET_A_ID`, `APP_PRIVATE_SUBNET_C_ID`)
-     - DB 프라이빗 서브넷 2개 (`DB_PRIVATE_SUBNET_A_ID`, `DB_PRIVATE_SUBNET_C_ID`)
-   - Route 53 Hosted Zone ID (`ROUTE53_HOSTED_ZONE_ID`) 및 도메인 이름 (`DOMAIN_NAME`)
+### 4.1 네트워크 (VPC)
+- `provision-aws-resources.sh vpc` 한 번으로 VPC `10.0.0.0/16`, 서브넷 6개(퍼블릭·앱·DB × 2 AZ), IGW, 라우트 테이블 4개, AZ별 NAT 2개를 멱등하게 생성합니다.
+- 앱 서브넷은 VPC CNI의 Pod당 IP 소비를 고려해 `/20` 으로 크게 잡았고, DB 서브넷에 인터넷 경로가 생기면 스크립트가 실패하고 멈춥니다(Fail-Closed).
+
+### 4.2 데이터베이스 (RDS MySQL 8.4)
+- Multi-AZ, gp3 암호화, 퍼블릭 접근 비활성화, `require_secure_transport=ON`, 자동 백업 7일, 삭제 방지.
+- DB 계정을 역할별로 3분리(admin: `db-init` Job / app: `was` CRUD만 / backup: 덤프 읽기 권한만)하고, 비밀번호는 무작위 생성 후 Secrets Manager에 바로 저장합니다.
+- 처음 설계한 8.0.39는 서울 리전에서 생성할 수 없었고 8.0은 표준 지원 종료로 확장 지원 요금이 붙어 **8.4 LTS**로 변경했습니다.
+
+### 4.3 이미지 빌드
+- 작업 서버(LXC)에서 컨테이너 빌드가 불가해 **AWS CodeBuild** 파이프라인을 만들었습니다 (`scripts/build-and-push.sh`, `buildspec.yml`).
+- 멀티스테이지 빌드로 빌드 도구를 실행 이미지에서 제외, `latest` 금지·ECR `IMMUTABLE` 태그로 실행 중인 코드를 항상 추적할 수 있게 했습니다.
+
+### 4.4 EKS 클러스터와 3티어 노드 분리
+- `eksctl` + `infra/eksctl/cluster.yaml`, OIDC + **IRSA**(컨트롤러별 전용 IAM 역할, 정적 키 없음).
+- EKS 1.36을 고른 이유: `PodTopologySpread` 의 `matchLabelKeys`, 선언형 `preStop.sleep` 이 GA.
+
+| 노드 | 관리 | 워크로드 |
+|---|---|---|
+| `np-app` / `np-app-spot` | Karpenter NodePool (On-Demand 우선, 초과분 Spot) | NGF, web, was |
+| `ng-critical` | EKS 관리형 노드 그룹 (Taint) | CoreDNS, LBC, Karpenter, KEDA, ESO, DB Job |
+| `ng-platform` | EKS 관리형 노드 그룹 (Taint) | Prometheus, Grafana, Alertmanager, OTel, Tempo |
+
+### 4.5 카나리 배포
+- `web`/`was-stable` 과 `web-canary`/`was-canary` 버전을 분리합니다.
+- 배포 시 `HTTPRoute` 를 **100:0** 으로 고정한 뒤 카나리를 롤아웃하고, `X-Canary: always` 헤더로 동적 DB 경로를 검증한 후에만 비율(기본 90:10)을 엽니다. 확대·롤백은 `scripts/set-canary-weight.sh` 로 재배포 없이 합니다.
+
+### 4.6 오토스케일링
+- **web**: CPU 60% 기준 HPA. **was**: Prometheus 요청률(50 req/s/Pod) 기준 KEDA `ScaledObject` (fallback 포함).
+- Pod당 JDBC Pool 상한 `maxActive=10` 으로 최대 확장 시에도 RDS `max_connections` 고갈을 막습니다.
+
+### 4.7 보안
+- WAF 관리형 규칙 3종 + `/was`·`/grafana` IP 허용 목록, ALB HTTPS 강제.
+- 모든 컨테이너 비루트(UID 10001), `readOnlyRootFilesystem`, `capabilities.drop: ALL`, `seccompProfile: RuntimeDefault`.
+- `petclinic` 네임스페이스 `default-deny-all` NetworkPolicy, IMDSv2 강제·Pod IMDS 차단.
+- 시크릿은 Secrets Manager → External Secrets Operator 동기화, 무중단 회전 스크립트 제공.
+
+### 4.8 관측성
+- Prometheus·Grafana·Alertmanager(Slack 알림), Fluent Bit → CloudWatch Logs.
+- OpenTelemetry Operator가 이미지 재빌드 없이 Java agent를 주입하고 `service.version=stable|canary` 로 카나리를 구분합니다. 트레이스는 10% 샘플링, RED 메트릭은 100% 집계, exemplar로 Grafana 패널 → Tempo 트레이스로 이동합니다.
+
+### 4.9 백업과 비용 관리
+- `db-backup` CronJob이 매일 03:00 KST `mysqldump` 결과를 S3(SSE-KMS, 버전 관리)에 적재합니다.
+- `daily-stop.sh` / `daily-start.sh` 로 업무 외 시간에 앱 노드·RDS·노드 그룹을 내리고, `--stop-nat` 으로 NAT Gateway까지 삭제해 비용을 줄입니다.
 
 ---
 
-## 4. 빠른 시작 가이드 (Quickstart)
+## 5. 운영 검증 결과
 
-### Step 1. 환경변수 파일(`.env`) 구성
-템플릿을 복사한 뒤 실제 AWS 계정·VPC 서브넷·도메인 정보를 입력합니다 (`.env` 파일은 `.gitignore`에 의해 커밋되지 않습니다).
+| 항목 | 내용 | 결과 |
+|---|---|---|
+| 카나리 실연 (v1.0.2) | 90:10 관측 10분 → 롤백 0% → 0/50/100% → 승격 | 1,996건 중 실패 0, 5xx 0, 롤백 반영 3초 |
+| 롤링 배포 AZ 분산 | `matchLabelKeys: [pod-template-hash]` 적용 | 수정 전 한 AZ 몰림 → 수정 후 2a/2c 유지 |
+| 무중단 롤링 재시작 | `preStop.sleep 15s` 로 EndpointSlice 전파 지연 흡수 | 실패 707건 중 2건 → **923건 중 0건** |
+| Grafana 경로 보안 | 비허용 IP 접근 + 인코딩·대소문자 우회 시도 | 모두 403, 앱 영향 없음 |
+| 5xx 알림 정확도 | 404 10건 발생 후 7분 관찰 | 새 규칙 inactive (예전 규칙이면 critical 발송) |
+| 공개 페이지 / 직원 앱 분리 (v1.0.4) | WAF 규칙 → 카나리 검증 → 승격 | `/` 공개, `/was/`·`/grafana/` 비허용 IP 403 |
+| 부하 테스트 (k6) | 50 → 150 → 300 → 450 req/s 단계 부하 | 276,139건, 실패 0.0018%, 5xx 0, p95 48ms, RDS CPU 최고 39.5% |
+
+---
+
+## 6. 트러블슈팅 (주요 사례)
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| 작업 서버에서 이미지 빌드 불가 | LXC 컨테이너의 rootless podman 제약 | AWS CodeBuild 빌드 파이프라인 도입 |
+| `eksctl create cluster` exit 1 | 기본 애드온 `metrics-server` 가 taint 노드에서 Pending | 애드온 삭제 후 Helm으로 별도 설치 |
+| 재배포 후 `x509: unknown authority` | `helm upgrade` 가 웹훅 인증서를 재발급 | `keepTLSSecret=true` |
+| Slack 알림 전부 실패 (`400 no_text`) | Incoming Webhook은 일반 webhook JSON을 받지 않음 | `slack_configs` + `api_url_file` |
+| 롤아웃 후 Pod가 한 AZ에 몰림 | 분산 계산에 구버전 ReplicaSet Pod 포함 | `matchLabelKeys: [pod-template-hash]` |
+| 재시작 중 502/504 | EndpointSlice 전파 지연 | `preStop.sleep 15s`, grace 35/45초 |
+| WAF `/grafana` 규칙 미매칭 | CLI v2가 `SearchString` 을 base64로 해석 | `--cli-binary-format raw-in-base64-out` |
+| 404 몇 건에 5xx 알림 pending | Tomcat `errorCount` 가 4xx도 집계 | OTel RED 메트릭 `status_code=~"5.."` 로 교체 + promtool 테스트 |
+| 새 WAS가 Ready 안 됨 | emptyDir가 이미지의 `rewrite.config` 를 가림 | 시작 스크립트에서 복사 |
+| 리다이렉트가 `http://` 로 감 | 프록시 뒤 Tomcat이 scheme을 http로 인식 | `X-Forwarded-Proto` + `RemoteIpValve` |
+
+---
+
+## 7. 회고 및 개선 방향
+
+**잘된 점**
+- 모든 인프라·배포를 멱등 스크립트로 만들어 매일 중지·기동하면서도 같은 환경을 재현할 수 있었습니다.
+- 카나리 100:0 격리 → 헤더 검증 → 개방 절차 덕분에 잘못된 태그 배포(v1.0.3) 두 번이 사용자 영향 없이 검사에서 멈췄습니다.
+- 수치로 검증(요청 실패 건수, AZ 분포, 알림 상태)하고 나서야 기능을 완료로 봤습니다.
+
+**후속 과제**
+- `cluster.yaml` 에서 eksctl 기본 애드온 끄기
+- `daily-stop` 시 PDB(`allowed=0`)로 인한 노드 종료 대기 대응
+- 배포 스크립트에서 명령줄 이미지 태그가 `.env` 보다 우선하도록 처리
+- 비밀이 아닌 `.env` 값의 안전한 보관 위치 마련
+- CodePipeline 기반 자동 배포
+
+**협업 방식**: 설계·보안 점검(Antigravity), 구현(Claude), 코드 리뷰(Codex)로 AI 에이전트 역할을 나누고 기능마다 `design.md → 구현 → review.md/security.md` 순서로 진행했습니다 ([`ORCA_WORKFLOW.md`](./ORCA_WORKFLOW.md)).
+
+---
+
+## 8. 실행 방법
+
+설치·배포·운영 절차는 [`docs/getting-started.md`](./docs/getting-started.md) 에 있습니다.
+
 ```bash
-cp .env.example .env
-# .env 파일을 열어 AWS_ACCOUNT_ID, VPC_ID, 서브넷 ID, DOMAIN_NAME, EBS_CSI_ADDON_VERSION 등을 입력
-```
-
-### Step 2. AWS 주변 인프라 및 EKS 클러스터 프로비저닝
-각 단계는 멱등(Idempotent)하게 동작하므로 중간에 중단되더라도 안전하게 재실행할 수 있습니다.
-```bash
-# 0) VPC 10.0.0.0/16, 서브넷 6개(퍼블릭 10.0.0.0/24·10.0.1.0/24, 앱 10.0.16.0/20·10.0.32.0/20, DB 10.0.48.0/24·10.0.49.0/24),
-#    IGW, 라우트 테이블 4개, AZ별 NAT 2개 생성 (리전은 ap-northeast-2 고정, Name=petclinic-* 태그로 찾아 재사용)
-./infra/aws/provision-aws-resources.sh vpc
-# 마지막에 출력된 VPC_ID 와 서브넷 ID 6개를 .env에 반영
-
-# 1) IAM Policy/Role, ECR 리포지토리, CloudWatch Log Group, 백업용·Tempo용 S3 버킷, CodeBuild(소스 버킷·서비스 역할·프로젝트), WAFv2 WebACL, ACM 인증서 생성
-./infra/aws/provision-aws-resources.sh pre-cluster
-# 출력된 ECR_*_REPOSITORY_URI, WAF_WEB_ACL_ARN, ACM_CERTIFICATE_ARN을 .env에 반영
-
-# 2) eksctl 기반 EKS 1.36 클러스터(ng-critical, ng-platform) 생성 및 Karpenter discovery 태그 부여
-./infra/aws/provision-aws-resources.sh cluster
-
-# 3) RDS MySQL 8.4 LTS Multi-AZ(TLS 강제) 및 Secrets Manager 시크릿(admin/app/backup, Grafana, Alertmanager) 생성
-./infra/aws/provision-aws-resources.sh post-cluster
-
-# 4) /grafana 접근 허용 IP: .env 의 GRAFANA_ALLOWED_CIDRS(예: 203.0.113.7/32)로 WAF IP set과 차단 규칙(우선순위 0) 적용.
-#    필수 — 이 규칙이 없으면 deploy-all.sh 가 시작 전에 멈춥니다. 허용 IP가 바뀌면 이것만 다시 실행합니다.
-./infra/aws/provision-aws-resources.sh grafana-waf
-```
-> Grafana는 `https://<DOMAIN_NAME>/grafana/` 에서 열리며, 허용 IP 밖에서는 WAF가 403을 돌려줍니다. 관리자 계정은 Secrets Manager의 `GRAFANA_ADMIN_SECRET_NAME` 입니다.
-
-### Step 3. `web` / `was` 컨테이너 이미지 빌드 및 ECR 푸시
-```bash
-IMAGE_TAG=v1.0.0 ./scripts/build-and-push.sh
-```
-> 이미지는 AWS CodeBuild에서 빌드됩니다. 스크립트가 작업 트리(커밋 안 된 변경 포함, `.gitignore` 대상과 `.env*`·키 파일 제외)를 zip으로 묶어 CodeBuild 소스 버킷(1일 후 자동 삭제)에 올리고, `buildspec.yml` 로 `linux/amd64` 빌드 → ECR 푸시까지 진행 상황을 따라갑니다. 같은 태그가 이미 ECR에 있으면 빌드 전에 멈춥니다. 한 이미지만 빌드하려면 `BUILD_TARGET=web` 또는 `was`, 로컬 Docker로 빌드하려면 `--local` 을 붙입니다. 실패하면 출력된 CloudWatch Logs 그룹(`/aws/codebuild/<프로젝트명>`)에서 원인을 확인합니다.
-
-### Step 4. 클러스터 애드온·워크로드 전체 배포 및 카나리 검증
-```bash
+cp .env.example .env                                   # 값 입력
+./infra/aws/provision-aws-resources.sh vpc             # 이후 pre-cluster → cluster → post-cluster → grafana-waf
+IMAGE_TAG=v1.0.0 ./scripts/build-and-push.sh           # CodeBuild로 이미지 빌드·ECR 푸시
 STABLE_IMAGE_TAG=v1.0.0 CANARY_IMAGE_TAG=v1.0.0 ./scripts/deploy-all.sh
 ```
-> `deploy-all.sh`는 매니페스트 정적 검증(`validate-manifests.sh`) → 네임스페이스/StorageClass/Gateway API CRD 설치 → 클러스터 컨트롤러(LBC, Metrics Server, Karpenter, ESO) 설치 → Karpenter `np-app` 및 NGF 배포 → ESO 시크릿 동기화 대기 → 모니터링(Prometheus/Grafana/Alertmanager)·트레이싱(Tempo/OTel Collector, Operator는 컨트롤러 단계) 및 KEDA/Fluent Bit 설치 → `db-init` Job 및 `db-backup` CronJob 배포 → `HTTPRoute` `100:0` 격리 후 `was`/`web` 롤아웃 → Route 53 연결 → `X-Canary: always` 동적 경로 검증 → 통과 시 `STABLE_WEIGHT:CANARY_WEIGHT`(기본 `90:10`) 개방까지 순서대로 수행합니다.
 
 ---
 
-## 5. 운영 및 검증 런북 (Day-2 Operations)
-
-### 1) 오프라인 매니페스트 및 보안 정책 정적 검증
-클러스터 연결 없이 YAML 문법, 이미지 태그 고정(`:latest` 금지), 평문 시크릿 부재, 3-Tier 노드 배치(`nodeSelector`/`tolerations`), 비루트 `securityContext`, 역할별 DB 시크릿 분리, 커넥션 풀 상한(`maxActive <= 10`), KEDA `fallback`, Prometheus Multi-AZ HA, PDB 등을 일괄 검사합니다.
-```bash
-./scripts/validate-manifests.sh
-```
-
-### 2) Prometheus 알림 규칙 단위 테스트
-`PetClinicDBBackupFailed`(첫 성공 없음 / 26시간 초과 / 복구 시 해제), `PetClinicKedaMetricsError`, `PetClinicHttp5xxRateHigh` 알림 규칙을 `promtool`로 검증합니다.
-```bash
-./scripts/test-prometheus-rules.sh
-```
-
-### 3) 카나리 배포 / 승격 / 롤백
-```bash
-# 새 후보 버전(v1.1.0) 빌드 및 푸시
-IMAGE_TAG=v1.1.0 ./scripts/build-and-push.sh
-
-# Stable(v1.0.0)은 유지하고 Canary(v1.1.0)를 0%에서 검증 후 개방 (위험한 변경이면 5%처럼 작게)
-STABLE_IMAGE_TAG=v1.0.0 CANARY_IMAGE_TAG=v1.1.0 STABLE_WEIGHT=95 CANARY_WEIGHT=5 ./scripts/deploy-all.sh
-
-# 지표를 보며 재배포 없이 확대
-./scripts/set-canary-weight.sh 25
-
-# 카나리 이상 징후 발생 시 즉시 0%로 차단(롤백)
-./scripts/set-canary-weight.sh 0
-
-# 승격: 카나리 태그를 Stable로 재배포
-STABLE_IMAGE_TAG=v1.1.0 CANARY_IMAGE_TAG=v1.1.0 ./scripts/deploy-all.sh
-```
-
-### 4) DB 비밀번호 무중단 회전 (Secret Rotation)
-AWS Secrets Manager에서 `petclinic_app` 또는 `petclinic_backup` 비밀번호를 변경한 뒤 아래 스크립트를 실행하면, ESO 강제 동기화(`refreshTime` 갱신 확인) → `db-init` Job 재실행(`ALTER USER`) → `was-stable`/`was-canary` 롤링 재시작을 자동으로 수행합니다.
-```bash
-./scripts/rotate-db-secrets.sh
-```
-
-### 5) 업무 외 시간 중지·기동 (비용 절감)
-퇴근 시 앱 노드·RDS·관리형 노드 그룹을 내리고, `--stop-nat` 을 붙이면 마지막에 NAT Gateway 2개 삭제·EIP 반납까지 합니다(약 하루 USD 2.8 절감). 출근 시 `--start-nat` 은 노드보다 먼저 NAT를 만들고 앱 라우트 테이블을 새 NAT로 돌립니다.
-```bash
-./scripts/daily-stop.sh --stop-nat     # 또는 daily-stop.sh 후 ./scripts/nat-stop.sh
-./scripts/daily-start.sh --start-nat   # 또는 ./scripts/nat-start.sh 후 daily-start.sh
-```
-> `nat-stop.sh` 는 VPC 안의 EC2가 종료되기를 최대 5분(`NAT_STOP_INSTANCE_WAIT`) 기다리고, 그래도 남아 있으면 멈춥니다(노드 egress 보호, `--force` 로 무시). EIP는 NAT에 붙어 있던 것과 `petclinic-nat-2a/2c` 이름의 남은 것만 반납합니다. 둘 다 `--dry-run` 을 지원합니다.
-
----
-
-## 6. 디렉터리 구조 및 문서 안내
+## 9. 디렉터리 구조 및 문서
 
 ```text
 .
-├── .env.example                          # 환경변수 템플릿 (시크릿 평문 미포함)
-├── ORCA_WORKFLOW.md                      # 3-에이전트 역할 분담 및 협업 워크플로
-├── docs/
-│   ├── architecture.md                   # 시스템 전체 아키텍처 상세 문서 (현재 기준)
-│   ├── architecture.drawio{.svg,.png}    # 공식 AWS 아이콘 기반 아키텍처 다이어그램
-│   ├── design.md                         # 초기 구축 아키텍처·환경 설계서
-│   ├── review.md                         # 초기 구축 코드 리뷰 기록
-│   ├── security.md                       # 초기 구축 보안·인프라 점검 기록
-│   ├── daily/                            # 일일 작업 기록 (YYYY-MM-DD.md, TEMPLATE.md)
-│   └── features/
-│       └── production-hardening/         # 운영·보안·고가용성 강화 기능 문서
-│           ├── design.md                 # 기능 설계서
-│           ├── review.md                 # 기능 코드 리뷰 기록
-│           └── security.md               # 기능 보안·인프라 점검 기록
-├── app/                                  # spring-framework-petclinic 소스 코드 (WAR 빌드)
-├── docker/                               # web (Nginx 1.27) 및 was (Tomcat 11 + JMX Exporter) Dockerfile
-├── infra/                                # AWS 프로비저닝 스크립트, IAM 최소 권한 정책, eksctl, Karpenter
-├── k8s/                                  # Kubernetes 매니페스트 (base, secrets, jobs, web, was, gateway, monitoring, logging, tracing)
-├── tests/                                # PrometheusRule 단위 테스트 (promtool)
-└── scripts/                              # 빌드·배포·시크릿 회전·정적 검증 자동화 스크립트
+├── app/            # spring-framework-petclinic 소스 (WAR)
+├── docker/         # web (Nginx) / was (Tomcat 11 + JMX Exporter) Dockerfile
+├── infra/          # AWS 프로비저닝 스크립트, IAM 최소 권한 정책, eksctl, Karpenter
+├── k8s/            # Kubernetes 매니페스트 (base, secrets, jobs, web, was, gateway, monitoring, logging, tracing)
+├── scripts/        # 빌드·배포·카나리·시크릿 회전·중지/기동·정적 검증
+├── tests/          # PrometheusRule 단위 테스트 (promtool)
+└── docs/
+    ├── architecture.md        # 아키텍처 상세 명세
+    ├── getting-started.md     # 실행 가이드
+    ├── features/<기능명>/      # 기능별 design.md · review.md · security.md
+    └── daily/                 # 일일 작업 기록
 ```
 
-### 상세 문서 바로가기
-- **시스템 아키텍처 명세**: [`docs/architecture.md`](./docs/architecture.md)
-- **초기 설계 및 보안 감사**: [`docs/design.md`](./docs/design.md) · [`docs/security.md`](./docs/security.md) · [`docs/review.md`](./docs/review.md)
-- **운영·보안 강화(`production-hardening`) 설계 및 감사**: [`docs/features/production-hardening/design.md`](./docs/features/production-hardening/design.md) · [`docs/features/production-hardening/security.md`](./docs/features/production-hardening/security.md) · [`docs/features/production-hardening/review.md`](./docs/features/production-hardening/review.md)
-- **멀티 에이전트 워크플로**: [`ORCA_WORKFLOW.md`](./ORCA_WORKFLOW.md) (`Antigravity` 설계·보안 점검 / `Claude` 구현 / `Codex` 코드 리뷰)
-- **일일 작업 기록**: [`docs/daily/`](docs/daily/)
+- 아키텍처 명세: [`docs/architecture.md`](./docs/architecture.md)
+- 초기 구축 설계·리뷰·보안 점검: [`docs/design.md`](./docs/design.md) · [`docs/review.md`](./docs/review.md) · [`docs/security.md`](./docs/security.md)
+- 기능별 문서: [`docs/features/`](./docs/features/)
+- 일일 작업 기록: [`docs/daily/`](./docs/daily/)
